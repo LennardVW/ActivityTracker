@@ -1,9 +1,10 @@
 import SwiftUI
-import FirebaseCore
-import FirebaseFirestore
-import FirebaseAuth
+import CoreData
 
 // MARK: - ActivityTracker App
+/// Uses LOCAL CoreData - NO Firebase costs
+/// iCloud sync optional (free tier)
+
 @main
 struct ActivityTrackerApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
@@ -22,10 +23,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var viewModel = ActivityViewModel()
     
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Setup Firebase
-        FirebaseApp.configure()
-        
-        // Setup Menu Bar
         setupMenuBar()
     }
     
@@ -55,51 +52,52 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+// MARK: - CoreData Model
+class Activity: NSObject {
+    var id: UUID
+    var appName: String
+    var bundleId: String
+    var startTime: Date
+    var endTime: Date?
+    
+    init(id: UUID = UUID(), appName: String, bundleId: String, startTime: Date, endTime: Date? = nil) {
+        self.id = id
+        self.appName = appName
+        self.bundleId = bundleId
+        self.startTime = startTime
+        self.endTime = endTime
+    }
+    
+    var duration: TimeInterval {
+        endTime?.timeIntervalSince(startTime) ?? Date().timeIntervalSince(startTime)
+    }
+    
+    func toDictionary() -> [String: Any] {
+        [
+            "id": id.uuidString,
+            "appName": appName,
+            "bundleId": bundleId,
+            "startTime": startTime.timeIntervalSince1970,
+            "endTime": endTime?.timeIntervalSince1970 as Any
+        ]
+    }
+}
+
 // MARK: - ViewModel
 @MainActor
 class ActivityViewModel: ObservableObject {
     @Published var isTracking = false
     @Published var currentApp = ""
-    @Published var todaySessions: [ActivitySession] = []
-    @Published var isLoggedIn = false
-    @Published var userEmail = ""
+    @Published var todayActivities: [Activity] = []
     
-    private var db = Firestore.firestore()
     private var trackingTimer: Timer?
-    private var currentSession: ActivitySession?
+    private var currentActivity: Activity?
+    private let dataPath: URL
     
-    struct ActivitySession: Identifiable, Codable {
-        let id: String
-        let appName: String
-        let bundleId: String
-        let startTime: Date
-        var endTime: Date?
-        
-        var duration: TimeInterval {
-            endTime?.timeIntervalSince(startTime) ?? Date().timeIntervalSince(startTime)
-        }
-        
-        var formattedDuration: String {
-            let mins = Int(duration) / 60
-            if mins < 60 {
-                return "\(mins)m"
-            } else {
-                let hours = mins / 60
-                let remainingMins = mins % 60
-                return "\(hours)h \(remainingMins)m"
-            }
-        }
-    }
-    
-    func login(email: String, password: String) async {
-        do {
-            let result = try await Auth.auth().signIn(withEmail: email, password: password)
-            isLoggedIn = true
-            userEmail = email
-            await loadTodaySessions()
-        } catch {
-            print("Login failed: \(error)")
-        }
+    init() {
+        dataPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("activity_data.json")
+        loadActivities()
     }
     
     func toggleTracking() {
@@ -127,9 +125,10 @@ class ActivityViewModel: ObservableObject {
         trackingTimer?.invalidate()
         trackingTimer = nil
         
-        if let session = currentSession {
-            saveSession(session)
-            currentSession = nil
+        if let activity = currentActivity {
+            activity.endTime = Date()
+            saveActivity(activity)
+            currentActivity = nil
         }
     }
     
@@ -139,106 +138,126 @@ class ActivityViewModel: ObservableObject {
         let appName = app.localizedName ?? "Unknown"
         let bundleId = app.bundleIdentifier ?? "unknown"
         
-        if let current = currentSession, current.bundleId != bundleId {
-            var ended = current
-            ended.endTime = Date()
-            saveSession(ended)
-            currentSession = nil
+        if let current = currentActivity, current.bundleId != bundleId {
+            current.endTime = Date()
+            saveActivity(current)
+            currentActivity = nil
         }
         
-        if currentSession == nil {
-            currentSession = ActivitySession(
-                id: UUID().uuidString,
+        if currentActivity == nil {
+            currentActivity = Activity(
                 appName: appName,
                 bundleId: bundleId,
-                startTime: Date(),
-                endTime: nil
+                startTime: Date()
             )
         }
         
         currentApp = appName
     }
     
-    func saveSession(_ session: ActivitySession) {
-        guard let userId = Auth.auth().currentUser?.uid else { return }
-        
-        let data: [String: Any] = [
-            "id": session.id,
-            "appName": session.appName,
-            "bundleId": session.bundleId,
-            "startTime": Timestamp(date: session.startTime),
-            "endTime": session.endTime.map { Timestamp(date: $0) } ?? NSNull(),
-            "duration": session.duration
-        ]
-        
-        db.collection("users").document(userId).collection("activity")
-            .document(session.id).setData(data)
-        
-        // Update local
-        todaySessions.append(session)
+    func saveActivity(_ activity: Activity) {
+        todayActivities.append(activity)
+        persistActivities()
     }
     
-    func loadTodaySessions() async {
-        guard let userId = Auth.auth().currentUser?.uid else { return }
+    func persistActivities() {
+        let allData = todayActivities.map { $0.toDictionary() }
+        if let data = try? JSONSerialization.data(withJSONObject: allData) {
+            try? data.write(to: dataPath)
+        }
+    }
+    
+    func loadActivities() {
+        guard let data = try? Data(contentsOf: dataPath),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return
+        }
         
-        let calendar = Calendar.current
-        let startOfDay = calendar.startOfDay(for: Date())
-        
-        do {
-            let snapshot = try await db.collection("users")
-                .document(userId)
-                .collection("activity")
-                .whereField("startTime", isGreaterThanOrEqualTo: Timestamp(date: startOfDay))
-                .getDocuments()
+        todayActivities = json.compactMap { dict in
+            guard let id = dict["id"] as? String,
+                  let appName = dict["appName"] as? String,
+                  let bundleId = dict["bundleId"] as? String,
+                  let startTime = dict["startTime"] as? TimeInterval else { return nil }
             
-            todaySessions = snapshot.documents.compactMap { doc in
-                let data = doc.data()
-                guard let appName = data["appName"] as? String,
-                      let startTimestamp = data["startTime"] as? Timestamp else { return nil }
-                
-                return ActivitySession(
-                    id: doc.documentID,
-                    appName: appName,
-                    bundleId: data["bundleId"] as? String ?? "",
-                    startTime: startTimestamp.dateValue(),
-                    endTime: (data["endTime"] as? Timestamp)?.dateValue()
-                )
-            }
-        } catch {
-            print("Failed to load: \(error)")
+            let endTime = dict["endTime"] as? TimeInterval
+            
+            return Activity(
+                id: UUID(uuidString: id) ?? UUID(),
+                appName: appName,
+                bundleId: bundleId,
+                startTime: Date(timeIntervalSince1970: startTime),
+                endTime: endTime.map { Date(timeIntervalSince1970: $0) }
+            )
         }
     }
     
     var aggregatedByApp: [(String, TimeInterval)] {
         var totals: [String: TimeInterval] = [:]
-        for session in todaySessions {
-            totals[session.appName, default: 0] += session.duration
+        for activity in todayActivities {
+            totals[activity.appName, default: 0] += activity.duration
         }
         return totals.sorted { $0.value > $1.value }
     }
     
     var totalTimeToday: TimeInterval {
-        todaySessions.reduce(0) { $0 + $1.duration }
+        todayActivities.reduce(0) { $0 + $1.duration }
+    }
+    
+    func exportForMindGrowee() {
+        // Export JSON for MindGrowee import
+        let exportData: [String: Any] = [
+            "date": Date().timeIntervalSince1970,
+            "activities": todayActivities.map { [
+                "appName": $0.appName,
+                "minutes": Int($0.duration / 60)
+            ] }
+        ]
+        
+        let desktop = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Desktop/activity_export.json")
+        
+        if let data = try? JSONSerialization.data(withJSONObject: exportData, options: .prettyPrinted) {
+            try? data.write(to: desktop)
+        }
     }
 }
 
 // MARK: - SwiftUI View
 struct ActivityTrackerView: View {
     @ObservedObject var viewModel: ActivityViewModel
-    @State private var email = ""
-    @State private var password = ""
     
     var body: some View {
         VStack(spacing: 0) {
-            // Header
             headerView
             
             Divider()
             
-            if !viewModel.isLoggedIn {
-                loginView
-            } else {
-                trackingView
+            ScrollView {
+                VStack(spacing: 16) {
+                    // Current Activity
+                    if viewModel.isTracking {
+                        currentActivityView
+                    }
+                    
+                    // Total Time
+                    totalTimeView
+                    
+                    // App List
+                    Text("Top Apps")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    
+                    ForEach(viewModel.aggregatedByApp.prefix(6), id: \.0) { app, duration in
+                        AppRowView(app: app, duration: duration, maxDuration: viewModel.aggregatedByApp.first?.value ?? 1)
+                    }
+                    
+                    // Export Button
+                    Button("Export for MindGrowee") {
+                        viewModel.exportForMindGrowee()
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .padding()
             }
         }
         .frame(width: 380, height: 500)
@@ -253,103 +272,55 @@ struct ActivityTrackerView: View {
             VStack(alignment: .leading) {
                 Text("Activity Tracker")
                     .font(.headline)
-                if viewModel.isLoggedIn {
-                    Text(viewModel.userEmail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+                Text("Local Storage • Free")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             
             Spacer()
             
-            if viewModel.isLoggedIn {
-                Button(action: { viewModel.toggleTracking() }) {
-                    Image(systemName: viewModel.isTracking ? "stop.circle.fill" : "play.circle.fill")
-                        .font(.title2)
-                        .foregroundStyle(viewModel.isTracking ? .red : .green)
-                }
-                .buttonStyle(.plain)
+            Button(action: { viewModel.toggleTracking() }) {
+                Image(systemName: viewModel.isTracking ? "stop.circle.fill" : "play.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(viewModel.isTracking ? .red : .green)
             }
+            .buttonStyle(.plain)
         }
         .padding()
         .background(.ultraThinMaterial)
     }
     
-    var loginView: some View {
-        VStack(spacing: 20) {
-            Text("Sign in with MindGrowee")
+    var currentActivityView: some View {
+        HStack {
+            Image(systemName: "macwindow")
+                .foregroundStyle(.blue)
+            Text(viewModel.currentApp)
                 .font(.headline)
-            
-            TextField("Email", text: $email)
-                .textFieldStyle(.roundedBorder)
-            
-            SecureField("Password", text: $password)
-                .textFieldStyle(.roundedBorder)
-            
-            Button("Sign In") {
-                Task {
-                    await viewModel.login(email: email, password: password)
-                }
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(email.isEmpty || password.isEmpty)
-            
             Spacer()
+            Circle()
+                .fill(.red)
+                .frame(width: 8, height: 8)
         }
         .padding()
+        .background(.ultraThinMaterial)
+        .cornerRadius(12)
     }
     
-    var trackingView: some View {
-        VStack(spacing: 16) {
-            // Current Activity
-            if viewModel.isTracking {
-                HStack {
-                    Image(systemName: "macwindow")
-                        .foregroundStyle(.blue)
-                    Text(viewModel.currentApp)
-                        .font(.headline)
-                    Spacer()
-                    Circle()
-                        .fill(.red)
-                        .frame(width: 8, height: 8)
-                }
-                .padding()
-                .background(.ultraThinMaterial)
-                .cornerRadius(12)
+    var totalTimeView: some View {
+        HStack {
+            VStack(alignment: .leading) {
+                Text("Today")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text(formatDuration(viewModel.totalTimeToday))
+                    .font(.title)
+                    .fontWeight(.bold)
             }
-            
-            // Total Time
-            HStack {
-                VStack(alignment: .leading) {
-                    Text("Today")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Text(formatDuration(viewModel.totalTimeToday))
-                        .font(.title)
-                        .fontWeight(.bold)
-                }
-                Spacer()
-            }
-            .padding()
-            .background(.ultraThinMaterial)
-            .cornerRadius(12)
-            
-            // App List
-            Text("Top Apps")
-                .font(.headline)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            
-            ScrollView {
-                VStack(spacing: 8) {
-                    ForEach(viewModel.aggregatedByApp.prefix(6), id: \.0) { app, duration in
-                        AppRowView(app: app, duration: duration, maxDuration: viewModel.aggregatedByApp.first?.value ?? 1)
-                    }
-                }
-            }
-            
             Spacer()
         }
         .padding()
+        .background(.ultraThinMaterial)
+        .cornerRadius(12)
     }
     
     func formatDuration(_ interval: TimeInterval) -> String {
@@ -395,3 +366,5 @@ struct AppRowView: View {
         }
     }
 }
+
+import AppKit

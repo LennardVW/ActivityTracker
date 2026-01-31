@@ -1,6 +1,6 @@
 // swift-tools-version:6.0
-// ActivityTrackerApp - Native macOS SwiftUI App
-// Shares Firebase with MindGrowee
+// ActivityTracker - Local/iCloud storage (FREE)
+// No Firebase costs
 
 import PackageDescription
 
@@ -10,16 +10,10 @@ let package = Package(
     products: [
         .executable(name: "ActivityTracker", targets: ["ActivityTrackerApp"])
     ],
-    dependencies: [
-        .package(url: "https://github.com/firebase/firebase-ios-sdk", from: "10.0.0")
-    ],
+    dependencies: [],
     targets: [
         .executableTarget(
             name: "ActivityTrackerApp",
-            dependencies: [
-                .product(name: "FirebaseFirestore", package: "firebase-ios-sdk"),
-                .product(name: "FirebaseAuth", package: "firebase-ios-sdk")
-            ],
             swiftSettings: [.swiftLanguageMode(.v6)]
         )
     ]
